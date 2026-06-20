@@ -63,6 +63,7 @@ def run_training(
     val_dataset_path: str | None = None,
     eval_every: int = 0,
     eval_limit: int = 64,
+    dtype: torch.dtype = torch.float32,
 ) -> dict:
     from datasets import load_from_disk
 
@@ -79,7 +80,7 @@ def run_training(
         if eval_limit:
             val_ds = val_ds.select(range(min(eval_limit, len(val_ds))))
 
-    model = STILLModel(model_name, cfg=cfg, device=cfg.device)
+    model = STILLModel(model_name, cfg=cfg, device=cfg.device, dtype=dtype)
     model.perceiver.train()
     opt = torch.optim.Adam(model.perceiver.parameters(), lr=lr)
 
@@ -220,6 +221,12 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--num-blocks", type=int, default=2)
     ap.add_argument("--max-doc-tokens", type=int, default=2048)
     ap.add_argument("--device", default=None)
+    ap.add_argument(
+        "--dtype",
+        default="float32",
+        choices=["float32", "bfloat16", "float16"],
+        help="base model + perceiver dtype (use bfloat16 for large models to fit memory)",
+    )
     # W&B + periodic eval
     ap.add_argument("--wandb-project", default=None, help="enable W&B logging to this project")
     ap.add_argument("--wandb-run-name", default=None)
@@ -262,6 +269,7 @@ def main(argv: list[str] | None = None) -> None:
         val_dataset_path=args.val_dataset,
         eval_every=args.eval_every,
         eval_limit=args.eval_limit,
+        dtype=getattr(torch, args.dtype),
     )
 
 

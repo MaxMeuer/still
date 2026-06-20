@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import time
 
 import torch
 import torch.nn.functional as F
@@ -131,7 +132,14 @@ def run_training(
             wb.log({f"val/{k}": v for k, v in metrics.items()}, step=step)
         return metrics
 
+    use_cuda = cfg.device.startswith("cuda") and torch.cuda.is_available()
+
+    # baseline validation on the untrained (random-init) perceiver
+    if eval_every and val_ds is not None:
+        _run_eval_and_log(0)
+
     for step in range(steps):
+        t0 = time.perf_counter()
         row = ds[step % len(ds)]
         doc, query, answer = _row_to_tensors(row, model.device_str)
 
@@ -148,14 +156,31 @@ def run_training(
         gnorm = perceiver_grad_norm(model)
         opt.step()
 
+        # extra per-step diagnostics
+        answer_targets = answer.squeeze(0)
+        teacher_ce = F.cross_entropy(t_logits.float(), answer_targets).item()
+        student_ce = F.cross_entropy(s_logits.detach().float(), answer_targets).item()
+        step_time = time.perf_counter() - t0
+
         losses.append(loss.item())
         if log_every and step % log_every == 0:
             print(f"step {step:5d} | kl_nats/tok {loss.item():.4f} | perceiver_grad_norm {gnorm:.4f}")
         if wb is not None:
-            wb.log(
-                {"train/kl_nats_per_token": loss.item(), "train/perceiver_grad_norm": gnorm},
-                step=step,
-            )
+            log = {
+                "train/loss": loss.item(),
+                "train/kl_nats_per_token": loss.item(),
+                "train/perceiver_grad_norm": gnorm,
+                "train/lr": opt.param_groups[0]["lr"],
+                "train/student_answer_ce": student_ce,
+                "train/teacher_answer_ce": teacher_ce,
+                "train/student_ce_gap": student_ce - teacher_ce,
+                "train/step_time_s": step_time,
+                "train/doc_len": int(doc.shape[1]),
+                "train/answer_len": int(answer.shape[1]),
+            }
+            if use_cuda:
+                log["train/gpu_mem_alloc_gb"] = torch.cuda.memory_allocated() / 1e9
+            wb.log(log, step=step)
 
         if eval_every and val_ds is not None and (step + 1) % eval_every == 0:
             _run_eval_and_log(step + 1)

@@ -3,6 +3,9 @@
 Per step: teacher logits (no grad, full cache) and student logits (grad, compact cache),
 forward-KL ``KL(teacher || student)`` on the answer span only, Adam on the perceiver
 params only, checkpoint. The base model stays frozen and in eval mode.
+
+Optional Weights & Biases logging (``--wandb-project``) records the training KL curve,
+perceiver grad norm, and periodic validation metrics (``--val-dataset`` + ``--eval-every``).
 """
 
 from __future__ import annotations
@@ -51,6 +54,14 @@ def run_training(
     ckpt_every: int = 100,
     limit: int | None = None,
     seed: int = 0,
+    grad_clip: float = 0.0,
+    log_every: int = 1,
+    wandb_project: str | None = None,
+    wandb_run_name: str | None = None,
+    wandb_entity: str | None = None,
+    val_dataset_path: str | None = None,
+    eval_every: int = 0,
+    eval_limit: int = 64,
 ) -> dict:
     from datasets import load_from_disk
 
@@ -61,13 +72,64 @@ def run_training(
     if len(ds) == 0:
         raise SystemExit(f"dataset at {dataset_path} is empty")
 
+    val_ds = None
+    if val_dataset_path:
+        val_ds = load_from_disk(val_dataset_path)
+        if eval_limit:
+            val_ds = val_ds.select(range(min(eval_limit, len(val_ds))))
+
     model = STILLModel(model_name, cfg=cfg, device=cfg.device)
     model.perceiver.train()
     opt = torch.optim.Adam(model.perceiver.parameters(), lr=lr)
 
+    # optional W&B
+    wb = None
+    if wandb_project:
+        import wandb
+
+        wb = wandb.init(
+            project=wandb_project,
+            entity=wandb_entity,
+            name=wandb_run_name,
+            config={
+                "model_name": model_name,
+                "num_latents": cfg.num_latents,
+                "latent_dim": cfg.latent_dim,
+                "num_blocks": cfg.num_blocks,
+                "max_doc_tokens": cfg.max_doc_tokens,
+                "lr": lr,
+                "steps": steps,
+                "grad_clip": grad_clip,
+                "seed": seed,
+                "train_rows": len(ds),
+                "val_rows": len(val_ds) if val_ds is not None else 0,
+                "device": cfg.device,
+            },
+        )
+
+    # tokenizer only needed for periodic eval
+    tokenizer = None
+    if val_ds is not None:
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+
     os.makedirs(ckpt_dir, exist_ok=True)
     losses: list[float] = []
     final_ckpt = os.path.join(ckpt_dir, "perceiver_final.pt")
+
+    def _run_eval_and_log(step: int):
+        from still.eval import evaluate_model
+
+        metrics = evaluate_model(model, val_ds, tokenizer, cfg)
+        print(
+            f"  [eval @ {step}] mcq {metrics['mcq_accuracy']:.3f} "
+            f"(full {metrics['mcq_accuracy_full_baseline']:.3f}) "
+            f"ce_util {metrics['ce_utilization']:.3f}"
+        )
+        if wb is not None:
+            wb.log({f"val/{k}": v for k, v in metrics.items()}, step=step)
+        return metrics
 
     for step in range(steps):
         row = ds[step % len(ds)]
@@ -81,11 +143,22 @@ def run_training(
 
         opt.zero_grad()
         loss.backward()
+        if grad_clip and grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.perceiver.parameters(), grad_clip)
         gnorm = perceiver_grad_norm(model)
         opt.step()
 
         losses.append(loss.item())
-        print(f"step {step:5d} | kl_nats/tok {loss.item():.4f} | perceiver_grad_norm {gnorm:.4f}")
+        if log_every and step % log_every == 0:
+            print(f"step {step:5d} | kl_nats/tok {loss.item():.4f} | perceiver_grad_norm {gnorm:.4f}")
+        if wb is not None:
+            wb.log(
+                {"train/kl_nats_per_token": loss.item(), "train/perceiver_grad_norm": gnorm},
+                step=step,
+            )
+
+        if eval_every and val_ds is not None and (step + 1) % eval_every == 0:
+            _run_eval_and_log(step + 1)
 
         if ckpt_every and (step + 1) % ckpt_every == 0:
             path = os.path.join(ckpt_dir, f"perceiver_step_{step + 1}.pt")
@@ -93,7 +166,16 @@ def run_training(
 
     torch.save(model.perceiver.state_dict(), final_ckpt)
     print(f"wrote checkpoint to {final_ckpt}")
-    return {"losses": losses, "ckpt": final_ckpt}
+
+    final_metrics = None
+    if val_ds is not None:
+        final_metrics = _run_eval_and_log(steps)
+    if wb is not None:
+        if final_metrics:
+            wb.summary.update({f"final/{k}": v for k, v in final_metrics.items()})
+        wb.finish()
+
+    return {"losses": losses, "ckpt": final_ckpt, "final_metrics": final_metrics}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -106,11 +188,20 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--ckpt-every", type=int, default=100)
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--grad-clip", type=float, default=0.0)
+    ap.add_argument("--log-every", type=int, default=1)
     ap.add_argument("--num-latents", type=int, default=256)
     ap.add_argument("--latent-dim", type=int, default=256)
     ap.add_argument("--num-blocks", type=int, default=2)
     ap.add_argument("--max-doc-tokens", type=int, default=2048)
     ap.add_argument("--device", default=None)
+    # W&B + periodic eval
+    ap.add_argument("--wandb-project", default=None, help="enable W&B logging to this project")
+    ap.add_argument("--wandb-run-name", default=None)
+    ap.add_argument("--wandb-entity", default=None)
+    ap.add_argument("--val-dataset", default=None, help="held-out cache for periodic eval")
+    ap.add_argument("--eval-every", type=int, default=0, help="run val eval every N steps (0=off)")
+    ap.add_argument("--eval-limit", type=int, default=64)
     return ap
 
 
@@ -138,6 +229,14 @@ def main(argv: list[str] | None = None) -> None:
         ckpt_every=args.ckpt_every,
         limit=args.limit,
         seed=args.seed,
+        grad_clip=args.grad_clip,
+        log_every=args.log_every,
+        wandb_project=args.wandb_project,
+        wandb_run_name=args.wandb_run_name,
+        wandb_entity=args.wandb_entity,
+        val_dataset_path=args.val_dataset,
+        eval_every=args.eval_every,
+        eval_limit=args.eval_limit,
     )
 
 

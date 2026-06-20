@@ -50,11 +50,5 @@ For the real 0.6B run, drop the `--model` overrides (defaults to `Qwen/Qwen3-0.6
 
 ## Deferred
 
-The three correctness fixes (RoPE strip/re-apply with internal latent RoPE, final-RMSNorm
-removal before output projections, identity init + content-stripping biases), the Qwen3-4B
-headline run, and vLLM serving integration.
-
-## Reference
-
-- STILL paper: arXiv:2606.07878
-- Dataset: https://huggingface.co/datasets/emozilla/quality
+The three correctness fixes, the Qwen3-4B headline run, and vLLM serving integration.
+See `docs/specs/2026-06-20-kv-cache-compaction-prime-rl/`.

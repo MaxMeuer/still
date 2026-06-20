@@ -42,6 +42,80 @@ def _measured(fn, device: str):
     return fn(), 0
 
 
+def evaluate_model(model: STILLModel, ds, tokenizer, cfg: STILLConfig) -> dict:
+    """Compute the eval metrics for an already-built model over a dataset.
+
+    Reused by both ``run_eval`` (loads a checkpoint) and the training loop (periodic
+    validation). Restores the perceiver's train/eval mode on exit.
+    """
+    letters = letter_token_ids(tokenizer)
+    letter_idx = torch.tensor(letters, device=cfg.device)
+    was_training = model.perceiver.training
+    model.perceiver.eval()
+
+    compact_correct = full_correct = total = 0
+    ce_compact_sum = ce_full_sum = 0.0
+    doc_len_sum = 0
+    peak_compact = peak_full = 0
+
+    try:
+        with torch.no_grad():
+            for row in ds:
+                doc = torch.tensor([row["doc_input_ids"]], dtype=torch.long, device=cfg.device)
+                query = torch.tensor([row["query_input_ids"]], dtype=torch.long, device=cfg.device)
+                answer = torch.tensor([row["answer_input_ids"]], dtype=torch.long, device=cfg.device)
+                gold = int(row["gold_idx"])
+                doc_len_sum += doc.shape[1]
+
+                # --- compact path (compress + decode against the compact cache)
+                def _compact(doc=doc, query=query, answer=answer):
+                    cache = model.compress(doc)
+                    return model.decode(query, answer, cache)
+
+                s_logits, peak = _measured(_compact, cfg.device)
+                peak_compact = max(peak_compact, peak)
+
+                # --- full path (baseline)
+                def _full(doc=doc, query=query, answer=answer):
+                    return model.teacher_logits(doc, query, answer)
+
+                t_logits, peak = _measured(_full, cfg.device)
+                peak_full = max(peak_full, peak)
+
+                # MCQ: row 0 of the answer-predicting logits scores the letter token
+                compact_pred = int(s_logits[0].index_select(0, letter_idx).argmax().item())
+                full_pred = int(t_logits[0].index_select(0, letter_idx).argmax().item())
+                compact_correct += int(compact_pred == gold)
+                full_correct += int(full_pred == gold)
+
+                ce_compact_sum += _answer_ce(s_logits, row["answer_input_ids"])
+                ce_full_sum += _answer_ce(t_logits, row["answer_input_ids"])
+                total += 1
+    finally:
+        model.perceiver.train(was_training)
+
+    ce_compact = ce_compact_sum / max(total, 1)
+    ce_full = ce_full_sum / max(total, 1)
+    avg_doc_len = doc_len_sum / max(total, 1)
+    mc = model.base.config
+    head_dim = getattr(mc, "head_dim", mc.hidden_size // mc.num_attention_heads)
+
+    return {
+        "n": total,
+        "mcq_accuracy": compact_correct / max(total, 1),
+        "mcq_accuracy_full_baseline": full_correct / max(total, 1),
+        "ce_compact": ce_compact,
+        "ce_full": ce_full,
+        "ce_utilization": (ce_full / ce_compact) if ce_compact > 0 else float("nan"),
+        "compression_ratio": avg_doc_len / cfg.num_latents,
+        "kv_memory_ratio": _kv_memory_ratio(
+            mc.num_hidden_layers, mc.num_key_value_heads, head_dim, avg_doc_len, cfg.num_latents
+        ),
+        "peak_memory_compact": peak_compact,
+        "peak_memory_full": peak_full,
+    }
+
+
 def run_eval(
     *,
     dataset_path: str,
@@ -61,70 +135,9 @@ def run_eval(
     model = STILLModel(model_name, cfg=cfg, device=cfg.device)
     state = torch.load(ckpt_path, map_location=cfg.device)
     model.perceiver.load_state_dict(state)
-    model.perceiver.eval()
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    letters = letter_token_ids(tokenizer)
-    letter_idx = torch.tensor(letters, device=cfg.device)
-
-    compact_correct = full_correct = total = 0
-    ce_compact_sum = ce_full_sum = 0.0
-    doc_len_sum = 0
-    peak_compact = peak_full = 0
-
-    with torch.no_grad():
-        for row in ds:
-            doc = torch.tensor([row["doc_input_ids"]], dtype=torch.long, device=cfg.device)
-            query = torch.tensor([row["query_input_ids"]], dtype=torch.long, device=cfg.device)
-            answer = torch.tensor([row["answer_input_ids"]], dtype=torch.long, device=cfg.device)
-            gold = int(row["gold_idx"])
-            doc_len_sum += doc.shape[1]
-
-            # --- compact path (compress + decode against the compact cache)
-            def _compact(doc=doc, query=query, answer=answer):
-                cache = model.compress(doc)
-                return model.decode(query, answer, cache)
-
-            s_logits, peak = _measured(_compact, cfg.device)
-            peak_compact = max(peak_compact, peak)
-
-            # --- full path (baseline)
-            def _full(doc=doc, query=query, answer=answer):
-                return model.teacher_logits(doc, query, answer)
-
-            t_logits, peak = _measured(_full, cfg.device)
-            peak_full = max(peak_full, peak)
-
-            # MCQ: row 0 of the answer-predicting logits scores the letter token
-            compact_pred = int(s_logits[0].index_select(0, letter_idx).argmax().item())
-            full_pred = int(t_logits[0].index_select(0, letter_idx).argmax().item())
-            compact_correct += int(compact_pred == gold)
-            full_correct += int(full_pred == gold)
-
-            ce_compact_sum += _answer_ce(s_logits, row["answer_input_ids"])
-            ce_full_sum += _answer_ce(t_logits, row["answer_input_ids"])
-            total += 1
-
-    ce_compact = ce_compact_sum / max(total, 1)
-    ce_full = ce_full_sum / max(total, 1)
-    avg_doc_len = doc_len_sum / max(total, 1)
-    mc = model.base.config
-    head_dim = getattr(mc, "head_dim", mc.hidden_size // mc.num_attention_heads)
-
-    metrics = {
-        "n": total,
-        "mcq_accuracy": compact_correct / max(total, 1),
-        "mcq_accuracy_full_baseline": full_correct / max(total, 1),
-        "ce_compact": ce_compact,
-        "ce_full": ce_full,
-        "ce_utilization": (ce_full / ce_compact) if ce_compact > 0 else float("nan"),
-        "compression_ratio": avg_doc_len / cfg.num_latents,
-        "kv_memory_ratio": _kv_memory_ratio(
-            mc.num_hidden_layers, mc.num_key_value_heads, head_dim, avg_doc_len, cfg.num_latents
-        ),
-        "peak_memory_compact": peak_compact,
-        "peak_memory_full": peak_full,
-    }
+    metrics = evaluate_model(model, ds, tokenizer, cfg)
 
     print(json.dumps(metrics, indent=2))
     if out_path:

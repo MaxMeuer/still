@@ -5,7 +5,7 @@ import torch
 from still.model.perceiver import STILLLayerPerceiver, STILLPerceiver
 
 H_KV, T, D = 2, 64, 8
-T_LAT, D_LAT, BLOCKS = 16, 32, 2
+T_LAT, D_LAT, BLOCKS = 16, 2 * 8, 2  # latent_dim must be 2*head_dim for identity init
 
 
 def _layer():

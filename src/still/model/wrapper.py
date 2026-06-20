@@ -9,8 +9,8 @@ Three operations:
 - ``teacher_logits(doc_ids, query_ids, answer_ids)``: full-cache forward, no grad,
   stock attention; return answer-span logits.
 
-v1 is naive: post-RoPE/post-norm K/V are compressed directly (no RoPE strip/re-apply,
-no final-RMSNorm removal, no identity init).
+Includes all three correctness fixes: RoPE un-rotate/re-rotate (handled inside the
+perceiver), no final norm, and identity initialization.
 """
 
 from __future__ import annotations
@@ -77,7 +77,8 @@ class STILLModel(nn.Module):
         for i in range(len(self._attn_modules)):
             key = capture.layers[i].keys[0]  # [H_kv, T, D]
             value = capture.layers[i].values[0]
-            compact_k, compact_v, bias = self.perceiver.forward_layer(i, key, value)
+            seq_len = key.shape[-2]
+            compact_k, compact_v, bias = self.perceiver.forward_layer(i, key, value, seq_len)
             cache.add(compact_k, compact_v, bias)
         return cache
 

@@ -122,6 +122,22 @@ class CompactCache:
         self.compact_v.append(compact_v)
         self.bias.append(bias)
 
+    def extend(self, other: "CompactCache") -> None:
+        """Append another compacted chunk: concat per layer along the latent dim.
+
+        Used for chunked inference-time compaction — each compressed chunk adds ``t``
+        more compact positions per layer (K/V along dim -2, bias along dim -1).
+        """
+        if not self.compact_k:
+            self.compact_k = [t for t in other.compact_k]
+            self.compact_v = [t for t in other.compact_v]
+            self.bias = [t for t in other.bias]
+            return
+        for i in range(len(self.compact_k)):
+            self.compact_k[i] = torch.cat([self.compact_k[i], other.compact_k[i]], dim=-2)
+            self.compact_v[i] = torch.cat([self.compact_v[i], other.compact_v[i]], dim=-2)
+            self.bias[i] = torch.cat([self.bias[i], other.bias[i]], dim=-1)
+
     @property
     def num_layers(self) -> int:
         return len(self.compact_k)

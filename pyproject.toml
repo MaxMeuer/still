@@ -21,6 +21,7 @@ dependencies = [
 still-preprocess = "still.data.preprocess:main"
 still-train = "still.train:main"
 still-eval = "still.eval:main"
+still-serve = "still.serve.server:main"
 
 [dependency-groups]
 dev = ["pytest>=8.0.0", "ruff"]

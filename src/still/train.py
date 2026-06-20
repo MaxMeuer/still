@@ -64,6 +64,7 @@ def run_training(
     eval_every: int = 0,
     eval_limit: int = 64,
     dtype: torch.dtype = torch.float32,
+    device_map: str | None = None,
 ) -> dict:
     from datasets import load_from_disk
 
@@ -80,7 +81,7 @@ def run_training(
         if eval_limit:
             val_ds = val_ds.select(range(min(eval_limit, len(val_ds))))
 
-    model = STILLModel(model_name, cfg=cfg, device=cfg.device, dtype=dtype)
+    model = STILLModel(model_name, cfg=cfg, device=cfg.device, dtype=dtype, device_map=device_map)
     model.perceiver.train()
     opt = torch.optim.Adam(model.perceiver.parameters(), lr=lr)
 
@@ -227,6 +228,11 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["float32", "bfloat16", "float16"],
         help="base model + perceiver dtype (use bfloat16 for large models to fit memory)",
     )
+    ap.add_argument(
+        "--device-map",
+        default=None,
+        help="shard the frozen base across GPUs (e.g. 'auto') for models too large for one GPU",
+    )
     # W&B + periodic eval
     ap.add_argument("--wandb-project", default=None, help="enable W&B logging to this project")
     ap.add_argument("--wandb-run-name", default=None)
@@ -270,6 +276,7 @@ def main(argv: list[str] | None = None) -> None:
         eval_every=args.eval_every,
         eval_limit=args.eval_limit,
         dtype=getattr(torch, args.dtype),
+        device_map=args.device_map,
     )
 
 

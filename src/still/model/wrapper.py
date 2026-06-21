@@ -221,9 +221,20 @@ class STILLModel(nn.Module):
                 else:
                     acc.extend(block)
 
-        live = self._as_input(tokens)
+        return self.decode_generate(tokens, acc, max_new_tokens, **gen_kwargs)
+
+    @torch.no_grad()
+    def decode_generate(
+        self, live_tokens, cache: CompactCache | None, max_new_tokens: int = 256, **gen_kwargs
+    ) -> list[int]:
+        """Generate against ``[cache (compact prefix) + live_tokens]``; return new token ids.
+
+        ``cache`` may be None (plain generation). The server drives incremental compaction
+        by passing a CompactCache it maintains across turns.
+        """
+        live = self._as_input(live_tokens)
         eos = self.base.config.eos_token_id
-        if acc is None:
+        if cache is None:
             gen = self.base.generate(
                 input_ids=live, max_new_tokens=max_new_tokens, eos_token_id=eos, **gen_kwargs
             )
@@ -238,8 +249,8 @@ class STILLModel(nn.Module):
         top_p = gen_kwargs.get("top_p", None)
         top_k = gen_kwargs.get("top_k", None)
 
-        dyn = self._build_cache(acc)
-        biases = [acc.bias[i].to(self._layer_devices[i]) for i in range(acc.num_layers)]
+        dyn = self._build_cache(cache)
+        biases = [cache.bias[i].to(self._layer_devices[i]) for i in range(cache.num_layers)]
         prev_impl = self.base.config._attn_implementation
         self._set_biases(biases)
         self.base.config._attn_implementation = "still"

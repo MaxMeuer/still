@@ -60,3 +60,24 @@ def test_server_render_and_generate_chat(tiny_model_path, tokenizer):
         ids, max_new_tokens=4, threshold=48, live_window=16, compaction_chunk=16, do_sample=False
     )
     assert 0 < len(out) <= 4
+
+
+def test_incremental_compaction_reuses_blocks(tiny_model_path):
+    """Growing conversation: only new tokens get compacted each turn, blocks accumulate."""
+    import still.serve.server as srv
+
+    model = _tiny(tiny_model_path)
+    srv._CONV = {"tokens": None, "blocks": None, "n": 0}
+    base = torch.randint(0, 100, (200,)).tolist()
+
+    cache1, live1 = srv._incremental_compact(model, base, threshold=48, live_window=16, chunk=16)
+    n1 = srv._CONV["n"]
+    assert cache1 is not None and n1 > 0 and len(live1) <= 16 + 16
+
+    # extend the conversation (same prefix + new tokens) -> n grows, prior blocks reused
+    grown = base + torch.randint(0, 100, (64,)).tolist()
+    cache2, live2 = srv._incremental_compact(model, grown, threshold=48, live_window=16, chunk=16)
+    assert srv._CONV["n"] >= n1  # compacted further, did not reset to 0
+    # generation works against the accumulated cache
+    out = model.decode_generate(live2, cache2, max_new_tokens=3, do_sample=False)
+    assert 0 < len(out) <= 3

@@ -26,6 +26,36 @@ from still.model.wrapper import STILLModel
 # module-level state shared by the request handler
 _STATE: dict = {}
 _LOCK = threading.Lock()
+# incremental compaction state for the active conversation (compact only NEW tokens per turn)
+_CONV: dict = {"tokens": None, "blocks": None, "n": 0}
+
+
+def _incremental_compact(model, tokens, threshold, live_window, chunk):
+    """Return (compact_cache_or_None, live_tokens), compacting only newly-added tokens.
+
+    Reuses the compact blocks from the previous turn when this prompt extends it, so each
+    turn compresses only the new full chunks (O(new tokens), not O(conversation)).
+    """
+    global _CONV
+    if len(tokens) <= threshold:
+        _CONV = {"tokens": tokens, "blocks": None, "n": 0}
+        return None, tokens
+
+    n, acc = _CONV["n"], _CONV["blocks"]
+    prev = _CONV["tokens"]
+    if not (acc is not None and n > 0 and prev is not None and tokens[:n] == prev[:n]):
+        acc, n = None, 0  # conversation diverged -> recompact from scratch
+    live = tokens[n:]
+    while len(live) > live_window:
+        take = min(chunk, len(live) - live_window)
+        if take <= 0:
+            break
+        block = model.compact_tokens(live[:take])
+        acc = block if acc is None else (acc.extend(block) or acc)
+        n += take
+        live = live[take:]
+    _CONV = {"tokens": tokens, "blocks": acc, "n": n}
+    return acc, live
 
 
 def _build_state(args) -> dict:
@@ -61,6 +91,7 @@ def _build_state(args) -> dict:
         "threshold": args.threshold,
         "compaction_chunk": args.compaction_chunk,
         "live_window": args.live_window,
+        "max_conv_tokens": args.max_conversation_tokens,
         "default_max_new_tokens": args.max_new_tokens,
         "enable_thinking": args.enable_thinking,
     }
@@ -103,14 +134,30 @@ def _chat_completion(body: dict) -> dict:
     max_new = int(body.get("max_tokens") or st["default_max_new_tokens"])
 
     prompt_ids = _render_prompt(tok, messages, st["enable_thinking"])
+
+    # hard cap: stop the sample once the conversation crosses the token budget
+    if len(prompt_ids) > st["max_conv_tokens"]:
+        return {
+            "id": f"chatcmpl-still-{int(time.time() * 1000)}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": st["served_name"],
+            "choices": [
+                {"index": 0, "message": {"role": "assistant", "content": ""}, "finish_reason": "length"}
+            ],
+            "usage": {
+                "prompt_tokens": len(prompt_ids),
+                "completion_tokens": 0,
+                "total_tokens": len(prompt_ids),
+            },
+        }
+
     with _LOCK:
-        out_ids = model.generate_compacted(
-            prompt_ids,
-            max_new_tokens=max_new,
-            threshold=st["threshold"],
-            compaction_chunk=st["compaction_chunk"],
-            live_window=st["live_window"],
-            **_gen_kwargs(body),
+        cache, live = _incremental_compact(
+            model, prompt_ids, st["threshold"], st["live_window"], st["compaction_chunk"]
+        )
+        out_ids = model.decode_generate(
+            live, cache, max_new_tokens=max_new, **_gen_kwargs(body)
         )
     text = tok.decode(out_ids, skip_special_tokens=True)
     finish = "length" if len(out_ids) >= max_new else "stop"
@@ -178,6 +225,12 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--threshold", type=int, default=16384, help="prompt length that triggers compaction")
     ap.add_argument("--compaction-chunk", type=int, default=2048)
     ap.add_argument("--live-window", type=int, default=2048, help="recent tokens kept live after compaction")
+    ap.add_argument(
+        "--max-conversation-tokens",
+        type=int,
+        default=262144,
+        help="hard cap: stop a sample once its prompt crosses this many tokens (~256k)",
+    )
     ap.add_argument("--max-new-tokens", type=int, default=1024)
     ap.add_argument("--num-latents", type=int, default=256)
     ap.add_argument("--latent-dim", type=int, default=256)

@@ -30,11 +30,14 @@ _LOCK = threading.Lock()
 _CONV: dict = {"tokens": None, "blocks": None, "n": 0}
 
 
-def _incremental_compact(model, tokens, threshold, live_window, chunk):
+def _incremental_compact(model, tokens, threshold, live_window, chunk, mode="recursive"):
     """Return (compact_cache_or_None, live_tokens), compacting only newly-added tokens.
 
-    Reuses the compact blocks from the previous turn when this prompt extends it, so each
-    turn compresses only the new full chunks (O(new tokens), not O(conversation)).
+    Reuses the compact blocks from the previous turn when this prompt extends it, so each turn
+    compresses only the new full chunks (O(new tokens), not O(conversation)).
+
+    mode="recursive": fold each new chunk via ``recompact`` -> the cache stays a fixed size
+    (constant memory). mode="append": ``extend`` -> the cache grows (legacy, OOMs on long contexts).
     """
     global _CONV
     if len(tokens) <= threshold:
@@ -50,8 +53,13 @@ def _incremental_compact(model, tokens, threshold, live_window, chunk):
         take = min(chunk, len(live) - live_window)
         if take <= 0:
             break
-        block = model.compact_tokens(live[:take])
-        acc = block if acc is None else (acc.extend(block) or acc)
+        piece = live[:take]
+        if acc is None:
+            acc = model.compact_tokens(piece)  # first block: num_latents
+        elif mode == "recursive":
+            acc = model.recompact(acc, piece)  # merge -> still num_latents (constant)
+        else:
+            acc.extend(model.compact_tokens(piece))  # append (legacy, grows)
         n += take
         live = live[take:]
     _CONV = {"tokens": tokens, "blocks": acc, "n": n}
@@ -92,6 +100,7 @@ def _build_state(args) -> dict:
         "compaction_chunk": args.compaction_chunk,
         "live_window": args.live_window,
         "max_conv_tokens": args.max_conversation_tokens,
+        "compaction_mode": args.compaction_mode,
         "default_max_new_tokens": args.max_new_tokens,
         "enable_thinking": args.enable_thinking,
     }
@@ -154,11 +163,22 @@ def _chat_completion(body: dict) -> dict:
 
     with _LOCK:
         cache, live = _incremental_compact(
-            model, prompt_ids, st["threshold"], st["live_window"], st["compaction_chunk"]
+            model,
+            prompt_ids,
+            st["threshold"],
+            st["live_window"],
+            st["compaction_chunk"],
+            mode=st["compaction_mode"],
         )
         out_ids = model.decode_generate(
             live, cache, max_new_tokens=max_new, **_gen_kwargs(body)
         )
+    compact_latents = cache.num_latents if cache is not None else 0
+    print(
+        f"[req] prompt={len(prompt_ids)} compact_latents={compact_latents} live={len(live)} "
+        f"attended={compact_latents + len(live)} out={len(out_ids)} mode={st['compaction_mode']}",
+        flush=True,
+    )
     text = tok.decode(out_ids, skip_special_tokens=True)
     finish = "length" if len(out_ids) >= max_new else "stop"
 
@@ -230,6 +250,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=262144,
         help="hard cap: stop a sample once its prompt crosses this many tokens (~256k)",
+    )
+    ap.add_argument(
+        "--compaction-mode",
+        choices=["recursive", "append"],
+        default="recursive",
+        help="recursive = fixed-size compact cache (constant memory); append = grows (legacy)",
     )
     ap.add_argument("--max-new-tokens", type=int, default=1024)
     ap.add_argument("--num-latents", type=int, default=256)

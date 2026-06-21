@@ -62,6 +62,29 @@ def test_server_render_and_generate_chat(tiny_model_path, tokenizer):
     assert 0 < len(out) <= 4
 
 
+def test_recompact_keeps_constant_budget(tiny_model_path):
+    """Recursive compaction holds the cache at num_latents across N passes (constant memory)."""
+    model = _tiny(tiny_model_path)
+    budget = model.cfg.num_latents  # 4 for the tiny config
+    cache = model.compact_tokens(torch.randint(0, 100, (20,)).tolist())
+    assert cache.num_latents == budget
+    for _ in range(8):  # 1,2,...,8 passes
+        cache = model.recompact(cache, torch.randint(0, 100, (16,)).tolist())
+        assert cache.num_latents == budget  # never grows
+        assert cache.num_layers == model.base.config.num_hidden_layers
+
+
+def test_generate_against_recursive_cache(tiny_model_path):
+    model = _tiny(tiny_model_path)
+    cache = model.compact_tokens(torch.randint(0, 100, (20,)).tolist())
+    cache = model.recompact(cache, torch.randint(0, 100, (16,)).tolist())
+    out = model.decode_generate(
+        torch.randint(0, 100, (8,)).tolist(), cache, max_new_tokens=3, do_sample=False
+    )
+    assert 0 < len(out) <= 3
+    assert all(isinstance(t, int) for t in out)
+
+
 def test_incremental_compaction_reuses_blocks(tiny_model_path):
     """Growing conversation: only new tokens get compacted each turn, blocks accumulate."""
     import still.serve.server as srv
@@ -81,3 +104,25 @@ def test_incremental_compaction_reuses_blocks(tiny_model_path):
     # generation works against the accumulated cache
     out = model.decode_generate(live2, cache2, max_new_tokens=3, do_sample=False)
     assert 0 < len(out) <= 3
+
+
+def test_server_recursive_vs_append_growth(tiny_model_path):
+    """recursive mode holds the cache at num_latents across a growing conversation; append grows."""
+    import still.serve.server as srv
+
+    model = _tiny(tiny_model_path)
+    budget = model.cfg.num_latents
+    base = torch.randint(0, 100, (64,)).tolist()
+    grown = base + torch.randint(0, 100, (96,)).tolist()
+
+    # recursive: constant budget across turns
+    srv._CONV = {"tokens": None, "blocks": None, "n": 0}
+    srv._incremental_compact(model, base, 16, 16, 16, mode="recursive")
+    c_rec, _ = srv._incremental_compact(model, grown, 16, 16, 16, mode="recursive")
+    assert c_rec.num_latents == budget
+
+    # append: cache grows past the budget
+    srv._CONV = {"tokens": None, "blocks": None, "n": 0}
+    srv._incremental_compact(model, base, 16, 16, 16, mode="append")
+    c_app, _ = srv._incremental_compact(model, grown, 16, 16, 16, mode="append")
+    assert c_app.num_latents > budget

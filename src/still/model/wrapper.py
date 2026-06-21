@@ -184,6 +184,30 @@ class STILLModel(nn.Module):
         return cache
 
     @torch.no_grad()
+    def recompact(self, cache: CompactCache, new_token_ids) -> CompactCache:
+        """Re-compress ``[existing compact cache ; new chunk]`` back to ``num_latents`` latents.
+
+        Recursive (iterative) compaction: the perceiver consumes its own prior compact K/V
+        concatenated with the new chunk's raw K/V (the blog's "prepend the compact cache to the
+        next chunk, compact the combined cache"). Output is fixed-size, so the cache never grows
+        -> constant memory regardless of conversation length.
+        """
+        from transformers import DynamicCache
+
+        toks = self._as_input(new_token_ids)
+        capture = DynamicCache()
+        self.base(input_ids=toks, use_cache=True, past_key_values=capture)
+        out = CompactCache()
+        for i in range(len(self._attn_modules)):
+            new_k = capture.layers[i].keys[0].to(self.perceiver_device)  # [H_kv, chunk, D]
+            new_v = capture.layers[i].values[0].to(self.perceiver_device)
+            key = torch.cat([cache.compact_k[i], new_k], dim=-2)  # [H_kv, t + chunk, D]
+            value = torch.cat([cache.compact_v[i], new_v], dim=-2)
+            ck, cv, bias = self.perceiver.forward_layer(i, key, value)  # -> num_latents latents
+            out.add(ck, cv, bias)
+        return out
+
+    @torch.no_grad()
     def generate_compacted(
         self,
         token_ids,

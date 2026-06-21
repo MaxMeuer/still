@@ -45,6 +45,7 @@ def _build_state(args) -> dict:
         device=device,
         dtype=getattr(torch, args.dtype),
         device_map=args.device_map,
+        attn_implementation="sdpa",  # memory-efficient prefill for long contexts
     )
     if args.ckpt:
         state = torch.load(args.ckpt, map_location="cpu")
@@ -59,7 +60,7 @@ def _build_state(args) -> dict:
         "served_name": args.served_model_name,
         "threshold": args.threshold,
         "compaction_chunk": args.compaction_chunk,
-        "min_live": args.min_live,
+        "live_window": args.live_window,
         "default_max_new_tokens": args.max_new_tokens,
         "enable_thinking": args.enable_thinking,
     }
@@ -108,7 +109,7 @@ def _chat_completion(body: dict) -> dict:
             max_new_tokens=max_new,
             threshold=st["threshold"],
             compaction_chunk=st["compaction_chunk"],
-            min_live=st["min_live"],
+            live_window=st["live_window"],
             **_gen_kwargs(body),
         )
     text = tok.decode(out_ids, skip_special_tokens=True)
@@ -174,9 +175,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8200)
     ap.add_argument("--served-model-name", default="still-compact")
-    ap.add_argument("--threshold", type=int, default=16384, help="max attended length before compacting")
+    ap.add_argument("--threshold", type=int, default=16384, help="prompt length that triggers compaction")
     ap.add_argument("--compaction-chunk", type=int, default=2048)
-    ap.add_argument("--min-live", type=int, default=512)
+    ap.add_argument("--live-window", type=int, default=2048, help="recent tokens kept live after compaction")
     ap.add_argument("--max-new-tokens", type=int, default=1024)
     ap.add_argument("--num-latents", type=int, default=256)
     ap.add_argument("--latent-dim", type=int, default=256)

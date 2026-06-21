@@ -54,6 +54,7 @@ class STILLModel(nn.Module):
         device: str | None = None,
         dtype: torch.dtype = torch.float32,
         device_map: str | None = None,
+        attn_implementation: str = "eager",
     ):
         super().__init__()
         from transformers import AutoModelForCausalLM
@@ -65,17 +66,20 @@ class STILLModel(nn.Module):
         self.cfg = cfg or STILLConfig(model_name=model_name)
         self.device_str = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.device_map = device_map
+        # base attention for the non-"still" forwards (capture/compaction/teacher); the
+        # decode path always swaps in "still". Use "sdpa" for memory-efficient long prefills.
+        self._base_attn = attn_implementation
 
         if device_map:
             # shard the frozen base across GPUs; do not .to()
             self.base = AutoModelForCausalLM.from_pretrained(
-                model_name, dtype=dtype, attn_implementation="eager", device_map=device_map
+                model_name, dtype=dtype, attn_implementation=attn_implementation, device_map=device_map
             )
             self.input_device = self.base.get_input_embeddings().weight.device
             self.perceiver_device = torch.device("cuda:0")
         else:
             self.base = AutoModelForCausalLM.from_pretrained(
-                model_name, dtype=dtype, attn_implementation="eager"
+                model_name, dtype=dtype, attn_implementation=attn_implementation
             ).to(self.device_str)
             self.input_device = torch.device(self.device_str)
             self.perceiver_device = torch.device(self.device_str)
@@ -185,40 +189,37 @@ class STILLModel(nn.Module):
         token_ids,
         max_new_tokens: int = 256,
         threshold: int = 16384,
+        live_window: int = 2048,
         compaction_chunk: int = 2048,
-        min_live: int = 512,
-        safety: int = 256,
         **gen_kwargs,
     ) -> list[int]:
-        """Generate against a compacted KV cache so the attended length stays bounded.
+        """Generate with bounded attended length via STILL compaction.
 
-        Compacts the oldest tokens into compact blocks until
-        ``compact_len + live + max_new_tokens (+safety) <= threshold``, then runs HF
-        ``generate`` with the compact blocks as the cache prefix and the recent tokens live.
-        Returns only the newly generated token ids.
+        If the prompt exceeds ``threshold`` tokens, the oldest tokens are compressed (in
+        ``compaction_chunk`` spans) into compact blocks until only ``live_window`` recent
+        tokens remain live. The base model then attends over ``[compact blocks + live]``,
+        which stays small (``live_window`` bounds the O(n^2) attention), so generation never
+        hits the context limit. Returns only the newly generated token ids.
         """
         if isinstance(token_ids, torch.Tensor):
             tokens = token_ids.flatten().tolist()
         else:
             tokens = list(token_ids)
         acc: CompactCache | None = None
-        budget = threshold - max_new_tokens - safety
 
-        def compact_len() -> int:
-            return acc.num_latents if acc is not None else 0
-
-        # compact oldest tokens until under budget, always leaving >= min_live live tokens
-        while compact_len() + len(tokens) > budget and len(tokens) > min_live:
-            take = min(compaction_chunk, len(tokens) - min_live)
-            if take <= 0:
-                break
-            chunk_toks = tokens[:take]
-            tokens = tokens[take:]
-            block = self.compact_tokens(chunk_toks)
-            if acc is None:
-                acc = block
-            else:
-                acc.extend(block)
+        # only compact once the prompt crosses the threshold; then shrink live to live_window
+        if len(tokens) > threshold:
+            while len(tokens) > live_window:
+                take = min(compaction_chunk, len(tokens) - live_window)
+                if take <= 0:
+                    break
+                chunk_toks = tokens[:take]
+                tokens = tokens[take:]
+                block = self.compact_tokens(chunk_toks)
+                if acc is None:
+                    acc = block
+                else:
+                    acc.extend(block)
 
         live = self._as_input(tokens)
         eos = self.base.config.eos_token_id

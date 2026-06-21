@@ -31,11 +31,7 @@ def test_generate_compacted_bounded_and_finite(tiny_model_path):
     out = model.generate_compacted(
         prompt,
         max_new_tokens=5,
-        threshold=48,
-        compaction_chunk=16,
-        min_live=8,
-        safety=4,
-        do_sample=False,
+        threshold=48, live_window=16, compaction_chunk=16, do_sample=False,
     )
     assert isinstance(out, list)
     assert 0 < len(out) <= 5
@@ -61,6 +57,6 @@ def test_server_render_and_generate_chat(tiny_model_path, tokenizer):
     ids = _render_prompt(tokenizer, messages, enable_thinking=False)
     assert isinstance(ids, list) and all(isinstance(x, int) for x in ids)
     out = model.generate_compacted(
-        ids, max_new_tokens=4, threshold=64, compaction_chunk=16, min_live=8, safety=4, do_sample=False
+        ids, max_new_tokens=4, threshold=48, live_window=16, compaction_chunk=16, do_sample=False
     )
     assert 0 < len(out) <= 4

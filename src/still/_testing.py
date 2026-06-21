@@ -17,7 +17,8 @@ def build_tiny_model(seed: int = 0) -> Qwen3ForCausalLM:
     torch.manual_seed(seed)
     tok = AutoTokenizer.from_pretrained(TINY_TOKENIZER_SOURCE)
     cfg = Qwen3Config(
-        vocab_size=tok.vocab_size,
+        # len(tok) (not vocab_size) so chat special tokens (<|im_start|> etc.) are embeddable
+        vocab_size=len(tok),
         hidden_size=32,
         intermediate_size=64,
         num_hidden_layers=2,

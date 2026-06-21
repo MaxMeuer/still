@@ -65,20 +65,17 @@ def _build_state(args) -> dict:
     }
 
 
-def _render_prompt(tokenizer, messages, enable_thinking):
-    kwargs = {}
-    # Qwen3 supports an enable_thinking chat-template kwarg
+def _render_prompt(tokenizer, messages, enable_thinking) -> list[int]:
+    """Render messages to a flat list[int] of token ids (robust across transformers versions)."""
+    # Render to text first (apply_chat_template(tokenize=True) returns a BatchEncoding in
+    # transformers 5.x, which is awkward to normalize); then encode to a clean list[int].
     try:
-        return tokenizer.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=True,
-            enable_thinking=enable_thinking,
-            **kwargs,
+        text = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True, enable_thinking=enable_thinking
         )
     except TypeError:
-        # tokenizer/template without the enable_thinking kwarg
-        return tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True)
+        text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    return tokenizer.encode(text, add_special_tokens=False)
 
 
 def _gen_kwargs(body) -> dict:

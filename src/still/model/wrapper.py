@@ -27,6 +27,25 @@ from still.config import STILLConfig
 from still.model.attention import CompactCache, register_still_attention
 
 
+def _sample_next(logits, do_sample: bool, temperature: float, top_p, top_k) -> int:
+    """Pick the next token id from a [vocab] logits vector."""
+    if not do_sample or temperature <= 0:
+        return int(logits.argmax())
+    logits = logits / max(temperature, 1e-5)
+    if top_k:
+        kth = torch.topk(logits, int(top_k)).values[-1]
+        logits = logits.masked_fill(logits < kth, float("-inf"))
+    if top_p:
+        sorted_logits, sorted_idx = torch.sort(logits, descending=True)
+        cum = torch.softmax(sorted_logits, dim=-1).cumsum(dim=-1)
+        remove = cum > float(top_p)
+        remove[..., 1:] = remove[..., :-1].clone()
+        remove[..., 0] = False
+        logits[sorted_idx[remove]] = float("-inf")
+    probs = torch.softmax(logits, dim=-1)
+    return int(torch.multinomial(probs, 1).item())
+
+
 class STILLModel(nn.Module):
     def __init__(
         self,
@@ -188,9 +207,13 @@ class STILLModel(nn.Module):
         def compact_len() -> int:
             return acc.num_latents if acc is not None else 0
 
-        while compact_len() + len(tokens) > budget and len(tokens) > min_live + compaction_chunk:
-            chunk_toks = tokens[:compaction_chunk]
-            tokens = tokens[compaction_chunk:]
+        # compact oldest tokens until under budget, always leaving >= min_live live tokens
+        while compact_len() + len(tokens) > budget and len(tokens) > min_live:
+            take = min(compaction_chunk, len(tokens) - min_live)
+            if take <= 0:
+                break
+            chunk_toks = tokens[:take]
+            tokens = tokens[take:]
             block = self.compact_tokens(chunk_toks)
             if acc is None:
                 acc = block
@@ -205,24 +228,35 @@ class STILLModel(nn.Module):
             )
             return gen[0, live.shape[1] :].tolist()
 
+        # Manual decode loop: HF generate can't be used here because it treats
+        # past_key_values length as a prefix of input_ids; our compact cache is a
+        # separate compressed representation, not a prefix.
+        eos_ids = set(eos if isinstance(eos, (list, tuple)) else [eos])
+        do_sample = bool(gen_kwargs.get("do_sample", False))
+        temperature = float(gen_kwargs.get("temperature", 1.0))
+        top_p = gen_kwargs.get("top_p", None)
+        top_k = gen_kwargs.get("top_k", None)
+
         dyn = self._build_cache(acc)
         biases = [acc.bias[i].to(self._layer_devices[i]) for i in range(acc.num_layers)]
         prev_impl = self.base.config._attn_implementation
         self._set_biases(biases)
         self.base.config._attn_implementation = "still"
+        generated: list[int] = []
+        cur = live
         try:
-            gen = self.base.generate(
-                input_ids=live,
-                past_key_values=dyn,
-                use_cache=True,
-                max_new_tokens=max_new_tokens,
-                eos_token_id=eos,
-                **gen_kwargs,
-            )
+            for _ in range(max_new_tokens):
+                out = self.base(input_ids=cur, past_key_values=dyn, use_cache=True)
+                logits = out.logits[0, -1].float()
+                nxt = _sample_next(logits, do_sample, temperature, top_p, top_k)
+                generated.append(nxt)
+                if nxt in eos_ids:
+                    break
+                cur = torch.tensor([[nxt]], dtype=torch.long, device=self.input_device)
         finally:
             self.base.config._attn_implementation = prev_impl
             self._set_biases(None)
-        return gen[0, live.shape[1] :].tolist()
+        return generated
 
     @torch.no_grad()
     def teacher_logits(self, doc_ids, query_ids, answer_ids) -> torch.Tensor:

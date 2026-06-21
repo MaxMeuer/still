@@ -50,3 +50,17 @@ def test_generate_compacted_no_compaction_path(tiny_model_path):
         prompt, max_new_tokens=4, threshold=4096, compaction_chunk=2048, do_sample=False
     )
     assert 0 < len(out) <= 4
+
+
+def test_server_render_and_generate_chat(tiny_model_path, tokenizer):
+    """The server path: chat template -> clean list[int] -> compacted generation."""
+    from still.serve.server import _render_prompt
+
+    model = _tiny(tiny_model_path)
+    messages = [{"role": "user", "content": "hello " * 300 + "what is 2+2?"}]
+    ids = _render_prompt(tokenizer, messages, enable_thinking=False)
+    assert isinstance(ids, list) and all(isinstance(x, int) for x in ids)
+    out = model.generate_compacted(
+        ids, max_new_tokens=4, threshold=64, compaction_chunk=16, min_live=8, safety=4, do_sample=False
+    )
+    assert 0 < len(out) <= 4

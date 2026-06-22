@@ -27,8 +27,15 @@ from still.config import STILLConfig
 from still.model.attention import CompactCache, register_still_attention
 
 
-def _sample_next(logits, do_sample: bool, temperature: float, top_p, top_k) -> int:
-    """Pick the next token id from a [vocab] logits vector."""
+def _sample_next(
+    logits, do_sample: bool, temperature: float, top_p, top_k, recent_ids=None, repetition_penalty=1.0
+) -> int:
+    """Pick the next token id from a [vocab] logits vector (with optional repetition penalty)."""
+    if repetition_penalty and repetition_penalty != 1.0 and recent_ids:
+        idx = torch.tensor(sorted(set(int(t) for t in recent_ids)), device=logits.device)
+        vals = logits.index_select(0, idx)
+        vals = torch.where(vals > 0, vals / repetition_penalty, vals * repetition_penalty)
+        logits = logits.index_copy(0, idx, vals)
     if not do_sample or temperature <= 0:
         return int(logits.argmax())
     logits = logits / max(temperature, 1e-5)
@@ -272,6 +279,8 @@ class STILLModel(nn.Module):
         temperature = float(gen_kwargs.get("temperature", 1.0))
         top_p = gen_kwargs.get("top_p", None)
         top_k = gen_kwargs.get("top_k", None)
+        repetition_penalty = float(gen_kwargs.get("repetition_penalty", 1.0))
+        live_tail = live[0].tolist()[-256:]  # recent context for the repetition penalty
 
         dyn = self._build_cache(cache)
         biases = [cache.bias[i].to(self._layer_devices[i]) for i in range(cache.num_layers)]
@@ -284,7 +293,10 @@ class STILLModel(nn.Module):
             for _ in range(max_new_tokens):
                 out = self.base(input_ids=cur, past_key_values=dyn, use_cache=True)
                 logits = out.logits[0, -1].float()
-                nxt = _sample_next(logits, do_sample, temperature, top_p, top_k)
+                nxt = _sample_next(
+                    logits, do_sample, temperature, top_p, top_k,
+                    recent_ids=live_tail + generated, repetition_penalty=repetition_penalty,
+                )
                 generated.append(nxt)
                 if nxt in eos_ids:
                     break

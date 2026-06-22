@@ -123,7 +123,15 @@ def _gen_kwargs(body) -> dict:
     temperature = body.get("temperature", None)
     top_p = body.get("top_p", None)
     top_k = body.get("top_k", None)
-    out: dict = {}
+    if temperature is None:
+        # No temperature sent (e.g. terminus-2 defaults to none). Greedy decoding makes Qwen3
+        # degenerate into repetition on the lossy compacted context, so default to Qwen3's
+        # recommended non-thinking sampling + a repetition penalty to break the repeat-spam
+        # that the compressed conditioning induces.
+        # Plain Qwen3 sampling. (A repetition penalty over the prompt tokens was tried and
+        # regressed shallow-depth coherence without fixing deep-depth degeneration, so it's off.)
+        return {"do_sample": True, "temperature": 0.7, "top_p": 0.8, "top_k": 20}
+    out: dict = {"repetition_penalty": float(body.get("repetition_penalty", 1.0))}
     if temperature is not None and float(temperature) > 0:
         out["do_sample"] = True
         out["temperature"] = float(temperature)
@@ -174,12 +182,14 @@ def _chat_completion(body: dict) -> dict:
             live, cache, max_new_tokens=max_new, **_gen_kwargs(body)
         )
     compact_latents = cache.num_latents if cache is not None else 0
+    text = tok.decode(out_ids, skip_special_tokens=True)
+    snippet = text[:200].replace("\n", "\\n")
     print(
         f"[req] prompt={len(prompt_ids)} compact_latents={compact_latents} live={len(live)} "
-        f"attended={compact_latents + len(live)} out={len(out_ids)} mode={st['compaction_mode']}",
+        f"attended={compact_latents + len(live)} out={len(out_ids)} mode={st['compaction_mode']} "
+        f"reply={snippet!r}",
         flush=True,
     )
-    text = tok.decode(out_ids, skip_special_tokens=True)
     finish = "length" if len(out_ids) >= max_new else "stop"
 
     return {
